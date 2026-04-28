@@ -21,6 +21,15 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+// ── Player clients to try in order (most permissive first) ────────────────────
+const PLAYER_CLIENTS = [
+  "tv_embedded",
+  "android",
+  "ios",
+  "web_embedded",
+  "mweb",
+];
+
 // ── App setup ─────────────────────────────────────────────────────────────────
 const app = express();
 app.use(bodyParser.json());
@@ -74,12 +83,99 @@ async function uploadToSupabase(filePath) {
   return urlData.publicUrl;
 }
 
+// ── Core: try one player client, resolve with file path or reject ─────────────
+function tryDownload(url, playerClient) {
+  return new Promise((resolve, reject) => {
+    console.log(`🎬 Trying player client: ${playerClient}`);
+
+    const outputTemplate = path.join(OUTPUT_DIR, "%(title)s.%(ext)s");
+
+    const ytdlp = spawn("python", [
+      "-m", "yt_dlp",
+      "--extractor-args", `youtube:player_client=${playerClient}`,
+      "-f", "best[ext=mp4][height<=1080]/best[ext=mp4]/best[height<=720]",
+      "-o", outputTemplate,
+      "--no-playlist",
+      "--print", "after_move:filepath",
+      url,
+    ]);
+
+    let downloadedFile = null;
+    let stderrBuf = "";
+
+    ytdlp.stdout.on("data", (data) => {
+      const line = data.toString().trim();
+      if (line && fs.existsSync(line)) {
+        downloadedFile = line;
+        console.log(`📄 File confirmed [${playerClient}]: ${downloadedFile}`);
+      }
+    });
+
+    ytdlp.stderr.on("data", (data) => {
+      const text = data.toString();
+      process.stderr.write(text);
+      stderrBuf += text;
+    });
+
+    ytdlp.on("close", (code) => {
+      if (code === 0 && downloadedFile && fs.existsSync(downloadedFile)) {
+        resolve({ file: downloadedFile, client: playerClient });
+      } else {
+        // Check if it's a bot/429 error — worth retrying with next client
+        const isRetryable =
+          stderrBuf.includes("429") ||
+          stderrBuf.includes("Sign in to confirm") ||
+          stderrBuf.includes("bot");
+
+        reject({
+          retryable: isRetryable,
+          client: playerClient,
+          details: stderrBuf.split("\n").slice(-6).filter(Boolean),
+        });
+      }
+    });
+
+    ytdlp.on("error", (err) => {
+      reject({
+        retryable: false,
+        client: playerClient,
+        details: [err.message],
+      });
+    });
+  });
+}
+
+// ── Try all clients in sequence, stop at first success ───────────────────────
+async function downloadWithFallback(url) {
+  let lastError = null;
+
+  for (const client of PLAYER_CLIENTS) {
+    try {
+      const result = await tryDownload(url, client);
+      console.log(`✅ Success with player client: ${client}`);
+      return result;
+    } catch (err) {
+      console.warn(`⚠️  Client [${client}] failed. Retryable: ${err.retryable}`);
+      lastError = err;
+
+      // If it's not a bot/429 issue (e.g. format not found), no point retrying
+      if (!err.retryable) {
+        console.error(`🛑 Non-retryable error on [${client}], stopping.`);
+        break;
+      }
+    }
+  }
+
+  // All clients failed
+  throw lastError;
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "yt-dlp server is running 🚀" });
 });
 
-app.post("/download", (req, res) => {
+app.post("/download", async (req, res) => {
   const { url } = req.body;
 
   if (!url) {
@@ -90,78 +186,37 @@ app.post("/download", (req, res) => {
     return res.status(400).json({ error: "Invalid URL provided." });
   }
 
-  console.log(`🎬 Starting download: ${url}`);
+  console.log(`\n📥 Download request: ${url}`);
 
-  const outputTemplate = path.join(OUTPUT_DIR, "%(title)s.%(ext)s");
+  try {
+    // Try all player clients until one works
+    const { file, client } = await downloadWithFallback(url);
 
-  const ytdlp = spawn("python", [
-    "-m", "yt_dlp",
-    "--extractor-args", "youtube:player_client=default",
-    "-f", "best[ext=mp4][height<=1080]/best[ext=mp4]/best[height<=720]",
-    "-o", outputTemplate,
-    "--no-playlist",
-    "--print", "after_move:filepath",
-    url,
-  ]);
+    // Upload the file to Supabase
+    const publicUrl = await uploadToSupabase(file);
 
-  let downloadedFile = null;
-  let stderrBuf = "";
+    return res.json({
+      status: "success",
+      message: "Video downloaded and stored in Supabase.",
+      playerClient: client,           // tells you which client worked
+      fileName: path.basename(publicUrl),
+      publicUrl,
+    });
+  } catch (err) {
+    // Clean up any partial file if it somehow exists
+    console.error("❌ All player clients failed.");
 
-  ytdlp.stdout.on("data", (data) => {
-    const line = data.toString().trim();
-    if (line && fs.existsSync(line)) {
-      downloadedFile = line;
-      console.log(`📄 File path confirmed: ${downloadedFile}`);
-    }
-  });
-
-  ytdlp.stderr.on("data", (data) => {
-    const text = data.toString();
-    process.stderr.write(text);
-    stderrBuf += text;
-  });
-
-  ytdlp.on("close", async (code) => {
-    console.log(`🔚 yt-dlp exited with code: ${code}`);
-
-    if (code === 0 && downloadedFile && fs.existsSync(downloadedFile)) {
-      try {
-        const publicUrl = await uploadToSupabase(downloadedFile);
-        return res.json({
-          status: "success",
-          message: "Video downloaded and stored in Supabase.",
-          fileName: path.basename(publicUrl),
-          publicUrl,
-        });
-      } catch (err) {
-        console.error("❌ Supabase upload failed:", err.message);
-        if (fs.existsSync(downloadedFile)) fs.unlinkSync(downloadedFile);
-        return res.status(500).json({
-          status: "error",
-          message: "Downloaded but Supabase upload failed.",
-          details: err.message,
-        });
-      }
-    } else {
-      return res.status(500).json({
-        status: "error",
-        message: "yt-dlp failed to download the video.",
-        details: stderrBuf.split("\n").slice(-8).filter(Boolean),
-      });
-    }
-  });
-
-  ytdlp.on("error", (err) => {
-    console.error("❌ Failed to spawn yt-dlp:", err.message);
     return res.status(500).json({
       status: "error",
-      message: "Could not start yt-dlp process.",
-      details: err.message,
+      message: "All YouTube player clients failed. Try passing cookies.",
+      lastClientTried: err.client,
+      details: err.details || [],
     });
-  });
+  }
 });
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
+  console.log(`🔄 Player client fallback order: ${PLAYER_CLIENTS.join(" → ")}`);
 });
