@@ -10,7 +10,11 @@ const { createClient } = require("@supabase/supabase-js");
 const PORT = process.env.PORT || 3000;
 const OUTPUT_DIR = path.join(__dirname, "downloads");
 const SUPABASE_BUCKET = "video-downloads";
-const COOKIES_PATH = "/etc/secrets/cookies.txt";
+// Render mounts secret files read-only, but yt-dlp writes refreshed cookies back
+// to the file it is given. So we copy the secret to a writable temp path and
+// hand yt-dlp the copy.
+const COOKIES_SECRET_PATH = "/etc/secrets/cookies.txt";
+const COOKIES_PATH = path.join(require("os").tmpdir(), "yt-cookies.txt");
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY;
@@ -41,11 +45,18 @@ if (!fs.existsSync(OUTPUT_DIR)) {
 }
 
 // Check if cookies file exists on startup
-const cookiesExist = fs.existsSync(COOKIES_PATH);
-console.log(cookiesExist
-  ? `🍪 Cookies file found at ${COOKIES_PATH}`
-  : `⚠️  No cookies file at ${COOKIES_PATH} — will try without cookies`
-);
+let cookiesExist = false;
+if (fs.existsSync(COOKIES_SECRET_PATH)) {
+  try {
+    fs.copyFileSync(COOKIES_SECRET_PATH, COOKIES_PATH);
+    cookiesExist = true;
+    console.log(`🍪 Cookies copied from ${COOKIES_SECRET_PATH} to writable ${COOKIES_PATH}`);
+  } catch (err) {
+    console.warn(`⚠️  Could not copy cookies file: ${err.message} — will try without cookies`);
+  }
+} else {
+  console.warn(`⚠️  No cookies file at ${COOKIES_SECRET_PATH} — will try without cookies`);
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 function sanitizeFilename(filename) {
